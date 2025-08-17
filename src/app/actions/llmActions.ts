@@ -2,54 +2,70 @@
 
 import { NotDiamond } from 'notdiamond';
 import { MODEL_CONFIGS, DEFAULT_ROUTING_RULES } from '@/lib/models';
-import type { ModelName, RoutingDecision, ModelResponse, PromptType, RoutingPriority, ProviderType } from '@/lib/models';
+import type { ModelName, RoutingDecision, ModelResponse, PromptType, RoutingPriority, ProviderType, ProviderHealth } from '@/lib/models';
 
 // Initialize NotDiamond client
 const notDiamond = new NotDiamond({
   apiKey: process.env.NOTDIAMOND_API_KEY,
 });
 
-// --- Helper Functions ---
+// --- NEW: In-Memory Store for Health Checks ---
+const providerHealth = new Map<ProviderType, ProviderHealth>();
+
+// --- NEW: Health Check System ---
+function reportFailure(provider: ProviderType) {
+  const status = providerHealth.get(provider) || { failureCount: 0 };
+  status.failureCount++;
+  if (status.failureCount >= 3) {
+    console.log(`[Health Check] Provider ${provider} has failed 3 times. Placing in 5-minute timeout.`);
+    status.timeoutUntil = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes from now
+  }
+  providerHealth.set(provider, status);
+}
+
+function reportSuccess(provider: ProviderType) {
+  if (providerHealth.has(provider)) {
+    providerHealth.get(provider)!.failureCount = 0;
+    providerHealth.get(provider)!.timeoutUntil = undefined;
+  }
+}
+
+// --- NEW: Server Action to expose health status to the UI ---
+export async function getHealthStatus(): Promise<Record<string, ProviderHealth>> {
+    return Object.fromEntries(providerHealth.entries());
+}
+
+// --- Helper Functions (Updated to use health status) ---
 function getAvailableProviders(excludeProviders: ProviderType[] = []): Array<{ provider: ProviderType; model: ModelName }> {
   const providers: Array<{ provider: ProviderType; model: ModelName }> = [];
   const allModelNames = Object.keys(MODEL_CONFIGS) as ModelName[];
+  const potentialProviders = ['openai', 'anthropic', 'google', 'mistral', 'togetherai'] as ProviderType[];
 
-  if (process.env.OPENAI_API_KEY && !excludeProviders.includes('openai')) providers.push(...allModelNames.filter(k => k.startsWith('openai/')).map(m => ({ provider: 'openai', model: m })));
-  if (process.env.ANTHROPIC_API_KEY && !excludeProviders.includes('anthropic')) providers.push(...allModelNames.filter(k => k.startsWith('anthropic/')).map(m => ({ provider: 'anthropic', model: m })));
-  if (process.env.GOOGLE_API_KEY && !excludeProviders.includes('google')) providers.push(...allModelNames.filter(k => k.startsWith('google/')).map(m => ({ provider: 'google', model: m })));
-  if (process.env.MISTRAL_API_KEY && !excludeProviders.includes('mistral')) providers.push(...allModelNames.filter(k => k.startsWith('mistral/')).map(m => ({ provider: 'mistral', model: m })));
-  if (process.env.TOGETHER_API_KEY && !excludeProviders.includes('togetherai')) providers.push(...allModelNames.filter(k => k.startsWith('togetherai/')).map(m => ({ provider: 'togetherai', model: m })));
-  
+  for (const provider of potentialProviders) {
+    // ADDED: Health Check
+    const health = providerHealth.get(provider);
+    const isTimedOut = health?.timeoutUntil && health.timeoutUntil > new Date();
+    
+    const envVar = `${provider.toUpperCase()}_API_KEY`.replace('TOGETHERAI', 'TOGETHER');
+    
+    if (process.env[envVar] && !excludeProviders.includes(provider) && !isTimedOut) {
+      providers.push(...allModelNames.filter(k => k.startsWith(`${provider}/`)).map(m => ({ provider, model: m })));
+    }
+  }
   return providers;
 }
 
 export async function classifyPrompt(prompt: string): Promise<PromptType> {
   const lowerPrompt = prompt.toLowerCase();
   
-  if (/\b(calculate|solve|equation|math|logic|proof|theorem)\b/.test(lowerPrompt) || /[\d\+\-\*\/=]/.test(prompt)) {
-      return 'math_logic';
-  }
-  if (/```|def |function |class |import |<\w+>/.test(prompt) || /\b(code|python|javascript|react|sql|debug|fix|implement)\b/.test(lowerPrompt)) {
-      return 'code_generation';
-  }
-  if (/\b(summarize|tldr|brief|outline|key points|recap)\b/.test(lowerPrompt)) {
-      return 'summarization';
-  }
-  if (/\b(translate|in french|in spanish|in german)\b/.test(lowerPrompt)) {
-      return 'translation';
-  }
-  if (/\b(analyze|analysis|compare|contrast|evaluate|assess)\b/.test(lowerPrompt)) {
-      return 'analysis';
-  }
-  if (/\b(story|poem|creative|narrative|write a scene)\b/.test(lowerPrompt)) {
-      return 'creative_writing';
-  }
-  if (prompt.length > 250 || /\b(explain in detail|comprehensive|thorough|elaborate)\b/.test(lowerPrompt)) {
-      return 'qa_complex';
-  }
-  if (/\?|what is|how to|who was|why does/.test(lowerPrompt)) {
-      return 'qa_simple';
-  }
+  if (/\b(calculate|solve|equation|math|logic|proof|theorem)\b/.test(lowerPrompt) || /[\d\+\-\*\/=]/.test(prompt)) return 'math_logic';
+  if (/```|def |function |class |import |<\w+>/.test(prompt) || /\b(code|python|javascript|react|sql|debug|fix|implement)\b/.test(lowerPrompt)) return 'code_generation';
+  if (/\b(summarize|tldr|brief|outline|key points|recap)\b/.test(lowerPrompt)) return 'summarization';
+  if (/\b(translate|in french|in spanish|in german)\b/.test(lowerPrompt)) return 'translation';
+  if (/\b(analyze|analysis|compare|contrast|evaluate|assess)\b/.test(lowerPrompt)) return 'analysis';
+  if (/\b(story|poem|creative|narrative|write a scene)\b/.test(lowerPrompt)) return 'creative_writing';
+  if (prompt.length > 250 || /\b(explain in detail|comprehensive|thorough|elaborate)\b/.test(lowerPrompt)) return 'qa_complex';
+  if (/\?|what is|how to|who was|why does/.test(lowerPrompt)) return 'qa_simple';
   
   return 'general_chat';
 }
@@ -88,7 +104,7 @@ export async function logRoutingDecision(decision: RoutingDecision, actualCost?:
   console.log('[Routing Analytics]', JSON.stringify({ ...decision, actualCost, latency, success }, null, 2));
 }
 
-// --- Main Function with AUTO-FALLBACK ---
+// --- Main Function with AUTO-FALLBACK & HEALTH CHECK INTEGRATION ---
 export async function getModelResponseWithRouting(
   prompt: string, 
   priority: RoutingPriority = 'cost',
@@ -135,6 +151,7 @@ export async function getModelResponseWithRouting(
       
       const latency = Date.now() - startTime;
       const modelUsed = result.providers[0];
+      reportSuccess(modelUsed.provider as ProviderType); // ADDED: Report success for health check
       
       const fullModelName = Object.keys(MODEL_CONFIGS).find(
         key => key.endsWith(modelUsed.model) && key.startsWith(modelUsed.provider)
@@ -152,6 +169,14 @@ export async function getModelResponseWithRouting(
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       console.warn(`[Attempt ${attempt} Failed] Error: ${errorMessage}`);
       
+      routingDecision = await routePrompt(prompt, priority, excludedProviders).catch(() => ({} as RoutingDecision));
+
+      // ADDED: Report failure to the Health Check system
+      const firstProvider = routingDecision.selectedModels?.[0]?.provider;
+      if (firstProvider) {
+          reportFailure(firstProvider);
+      }
+
       const errorString = errorMessage.toLowerCase();
       const isBillingError = errorString.includes('credit') || errorString.includes('quota') || errorString.includes('billing') || errorString.includes('429');
 
@@ -162,6 +187,7 @@ export async function getModelResponseWithRouting(
         else if (errorString.includes('google')) failedProvider = 'google';
         else if (errorString.includes('mistral')) failedProvider = 'mistral';
         else if (errorString.includes('together')) failedProvider = 'togetherai';
+        else if (firstProvider) failedProvider = firstProvider;
         
         if (failedProvider && !excludedProviders.includes(failedProvider)) {
           console.log(`[Auto-Fallback] Billing error detected for ${failedProvider}. Excluding and retrying.`);
@@ -170,7 +196,6 @@ export async function getModelResponseWithRouting(
         }
       }
       
-      routingDecision = await routePrompt(prompt, priority, excludedProviders).catch(() => ({} as RoutingDecision));
       await logRoutingDecision(routingDecision, undefined, Date.now() - startTime, false);
       return { error: `Routing failed: ${errorMessage}`, routingDecision };
     }
